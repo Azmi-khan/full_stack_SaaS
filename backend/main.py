@@ -1,5 +1,9 @@
 from datetime import datetime, timedelta, timezone
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import File, UploadFile
+import shutil
+import os
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
@@ -11,8 +15,16 @@ models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"], # Your React frontend URL
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods (GET, POST, DELETE, etc.)
+    allow_headers=["*"], # Allows all headers
+)
+
 #cryptography settings
-SECRET_KEY = "super_secret_key_change_this_in_production"
+SECRET_KEY = "my_brand_new_secret_key_123"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -48,6 +60,9 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+
+#user signup
 
 @app.post("/signup", response_model=schemas.UserResponse)
 
@@ -70,6 +85,9 @@ def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
 
     return new_user
 
+
+
+#user login and token generation
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.email == form_data.username).first()
@@ -81,9 +99,11 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}   
+    access_token = create_access_token(data={"sub": str(user.id)})
+    return {"access_token": access_token, "token_type": "bearer"}  
 
+
+#token vlidation and access to secure data
 @app.get("/secure-data")
 
 def get_secure_data(current_user_id: str = Depends(get_current_user)):
@@ -91,3 +111,75 @@ def get_secure_data(current_user_id: str = Depends(get_current_user)):
         "message": "Access Granted! You have a valid token.",
         "user_id": current_user_id
     }
+
+#uploading pdf files
+UPLOAD_DIR = "uploaded_pdf"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/upload")
+def upload_pdf(
+    file: UploadFile = File(...),
+    current_user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+
+):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    
+    file_location = f"{UPLOAD_DIR}/{file.filename}"
+    with open(file_location, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    new_doc = models.PDFDocument(
+        filename=file.filename,
+        user_id=int(current_user_id)
+    )
+    db.add(new_doc)
+    db.commit()
+    db.refresh(new_doc)
+
+    return{
+        "message" : "file uploaded successfully",
+        "document_id" : new_doc.id,
+        "filename" : new_doc.filename,
+    }
+#checking the documents of the user
+@app.get("/documents")
+def get_user_documents(
+    current_user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_docs = db.query(models.PDFDocument).filter(
+        models.PDFDocument.user_id == int(current_user_id)
+    ).all()
+
+    return {"documents" : user_docs}
+
+#deleting documents
+
+@app.delete("/documents/{document_id}")
+def delete_document(
+    document_id: int,
+    current_user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    doc = db.query(models.PDFDocument).filter(
+        models.PDFDocument.id == document_id,
+        models.PDFDocument.user_id == int(current_user_id)
+    ).first()
+
+    if not doc:
+        raise HTTPException(status_code=404,                
+            detail="Document not found or you don't have permission to delete it."
+    )
+    
+    #delete the file from the server
+    file_path = f"{UPLOAD_DIR}/{doc.filename}"
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+    #delete the record from the database
+    db.delete(doc)
+    db.commit()
+
+    return {"message": f"'{doc.filename}' deleted successfully."}
