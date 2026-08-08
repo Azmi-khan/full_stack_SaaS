@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi import File, UploadFile
+from fastapi.responses import FileResponse
 import shutil
 import os
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -10,6 +11,10 @@ from passlib.context import CryptContext
 import jwt
 import models, schemas
 from database import engine, get_db
+from worker import process_video_task
+from fastapi import WebSocket
+import asyncio
+from celery.result import AsyncResult
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -17,10 +22,10 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # Your React frontend URL
+    allow_origins=["http://localhost:5173"], 
     allow_credentials=True,
-    allow_methods=["*"], # Allows all methods (GET, POST, DELETE, etc.)
-    allow_headers=["*"], # Allows all headers
+    allow_methods=["*"], 
+    allow_headers=["*"], 
 )
 
 #cryptography settings
@@ -123,8 +128,8 @@ def upload_pdf(
     db: Session = Depends(get_db)
 
 ):
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    if not (file.filename.endswith(".mp4") or file.filename.endswith(".avi")):
+        raise HTTPException(status_code=400, detail="Only MP4 or AVI video files are allowed.")
     
     file_location = f"{UPLOAD_DIR}/{file.filename}"
     with open(file_location, "wb") as buffer:
@@ -137,12 +142,15 @@ def upload_pdf(
     db.add(new_doc)
     db.commit()
     db.refresh(new_doc)
+    task = process_video_task.delay(new_doc.filename)
 
-    return{
-        "message" : "file uploaded successfully",
-        "document_id" : new_doc.id,
-        "filename" : new_doc.filename,
+    return {
+        "message": "File uploaded successfully and processing started in the background.",
+        "document_id": new_doc.id,
+        "filename": new_doc.filename,
+        "task_id": task.id
     }
+
 #checking the documents of the user
 @app.get("/documents")
 def get_user_documents(
@@ -183,3 +191,36 @@ def delete_document(
     db.commit()
 
     return {"message": f"'{doc.filename}' deleted successfully."}
+
+@app.get("/documents")
+def get_documents(current_user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    
+    docs = db.query(models.PDFDocument).filter(models.PDFDocument.user_id == int(current_user_id)).all()
+    return docs
+
+@app.websocket("/ws/task/{task_id}")
+async def websocket_task_status(websocket: WebSocket, task_id: str):
+    await websocket.accept() 
+    try:
+        while True:
+            
+            result = AsyncResult(task_id)
+            
+            if result.state == 'PROGRESS':
+                
+                await websocket.send_json({"progress": result.info.get('progress', 0)})
+            elif result.state == 'SUCCESS':
+                
+                await websocket.send_json({"progress": 100, "status": "completed"})
+                break
+                
+            await asyncio.sleep(1) 
+    except Exception as e:
+        print("WebSocket disconnected")
+
+@app.get("/video/{filename}")
+def get_processed_video(filename: str):
+    file_path = f"{UPLOAD_DIR}/{filename}"
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="video/webm")
+    raise HTTPException(status_code=404, detail="Processed video not found")
