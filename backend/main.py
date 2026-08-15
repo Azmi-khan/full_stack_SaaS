@@ -122,34 +122,22 @@ UPLOAD_DIR = "uploaded_pdf"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.post("/upload")
-def upload_pdf(
-    file: UploadFile = File(...),
-    current_user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
-
-):
+async def upload_video(file: UploadFile = File(...), current_user_id: str = Depends(get_current_user)):
+    # Validate format
     if not (file.filename.endswith(".mp4") or file.filename.endswith(".avi")):
         raise HTTPException(status_code=400, detail="Only MP4 or AVI video files are allowed.")
     
-    file_location = f"{UPLOAD_DIR}/{file.filename}"
-    with open(file_location, "wb") as buffer:
+    # Sanitize filename to prevent space/URL encoding bugs
+    safe_filename = file.filename.replace(" ", "_")
+    file_path = f"{UPLOAD_DIR}/{safe_filename}"
+    
+    with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-
-    new_doc = models.PDFDocument(
-        filename=file.filename,
-        user_id=int(current_user_id)
-    )
-    db.add(new_doc)
-    db.commit()
-    db.refresh(new_doc)
-    task = process_video_task.delay(new_doc.filename)
-
-    return {
-        "message": "File uploaded successfully and processing started in the background.",
-        "document_id": new_doc.id,
-        "filename": new_doc.filename,
-        "task_id": task.id
-    }
+        
+    # Trigger background Celery task with the clean filename
+    task = process_video_task.delay(safe_filename)
+    
+    return {"filename": safe_filename, "task_id": task.id}
 
 #checking the documents of the user
 @app.get("/documents")
@@ -220,7 +208,11 @@ async def websocket_task_status(websocket: WebSocket, task_id: str):
 
 @app.get("/video/{filename}")
 def get_processed_video(filename: str):
-    file_path = f"{UPLOAD_DIR}/{filename}"
+    # Construct absolute path to ensure FastAPI looks in the correct directory
+    file_path = os.path.abspath(os.path.join(UPLOAD_DIR, filename))
+    print(f"Looking for video at: {file_path}")
+    
     if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="video/webm")
-    raise HTTPException(status_code=404, detail="Processed video not found")
+        return FileResponse(file_path, media_type="video/mp4")
+    
+    raise HTTPException(status_code=404, detail=f"Processed video not found at: {file_path}")

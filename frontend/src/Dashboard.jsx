@@ -47,7 +47,7 @@ function Dashboard() {
     setProcessedVideo(null) // Reset video on new file selection
   }
 
-  const handleUpload = async () => {
+const handleUpload = async () => {
     if (!file) {
       setUploadMessage('Please select a video file first.')
       return
@@ -65,7 +65,8 @@ function Dashboard() {
         }
       })
       
-      setUploadMessage(`Processing started for: ${response.data.filename}`)
+      const cleanFilename = response.data.filename
+      setUploadMessage(`Processing started for: ${cleanFilename}`)
       setFile(null)
       fetchDocuments(token)
       
@@ -83,10 +84,12 @@ function Dashboard() {
           if (wsData.status === "completed") {
             ws.close()
             
-            const originalName = file ? file.name : response.data.filename
-            const baseName = originalName.substring(0, originalName.lastIndexOf('.'))
+            const baseName = cleanFilename.substring(0, cleanFilename.lastIndexOf('.'))
             
-            setProcessedVideo(`http://127.0.0.1:8000/video/processed_${baseName}.webm`)
+            // NEW: Add a timestamp query parameter to bust the browser cache
+            const timestamp = new Date().getTime()
+            setProcessedVideo(`http://127.0.0.1:8000/video/processed_${baseName}.mp4?t=${timestamp}`)
+            
             setIsProcessing(false)
           }
         }
@@ -95,7 +98,6 @@ function Dashboard() {
       setUploadMessage('Upload failed. Ensure it is a valid .mp4 or .avi file.')
     }
   }
-
   return (
     <div style={{ padding: '20px', maxWidth: '600px', margin: '0 auto' }}>
       <h2>Autonomous Vehicle Perception Dashboard</h2>
@@ -119,7 +121,8 @@ function Dashboard() {
         {processedVideo && (
           <div style={{ marginTop: '20px' }}>
             <h3>Processed Output</h3>
-            <video width="100%" controls src={processedVideo} />
+            {/* Adding the key forces React to mount a brand new player, destroying the cached bug */}
+            <video key={processedVideo} width="100%" controls src={processedVideo} />
           </div>
         )}
       </div>
