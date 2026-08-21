@@ -22,3 +22,6 @@ frontend/.env
 frontend/.env.*
 
 backend/uploaded_videos/*.mp4
+
+/package.json
+/package-lock.json
