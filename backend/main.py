@@ -18,7 +18,7 @@ from celery.result import AsyncResult
 
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+app = FastAPI(title="Autonomous Vehicle Perception API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,12 +117,16 @@ def get_secure_data(current_user_id: str = Depends(get_current_user)):
         "user_id": current_user_id
     }
 
-#uploading pdf files
-UPLOAD_DIR = "uploaded_pdf"
+#uploading video files
+UPLOAD_DIR = "uploaded_videos"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.post("/upload")
-async def upload_video(file: UploadFile = File(...), current_user_id: str = Depends(get_current_user)):
+async def upload_video(
+    file: UploadFile = File(...),
+    current_user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     # Validate format
     if not (file.filename.endswith(".mp4") or file.filename.endswith(".avi")):
         raise HTTPException(status_code=400, detail="Only MP4 or AVI video files are allowed.")
@@ -133,58 +137,59 @@ async def upload_video(file: UploadFile = File(...), current_user_id: str = Depe
     
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
+    # Record this upload so it shows up in the user's run history and can be deleted later.
+    # (Previously nothing was ever saved here, so /videos always came back empty.)
+    new_video = models.ProcessedVideo(filename=safe_filename, user_id=int(current_user_id))
+    db.add(new_video)
+    db.commit()
+    db.refresh(new_video)
         
     # Trigger background Celery task with the clean filename
     task = process_video_task.delay(safe_filename)
     
-    return {"filename": safe_filename, "task_id": task.id}
+    return {"filename": safe_filename, "task_id": task.id, "video_id": new_video.id}
 
-#checking the documents of the user
-@app.get("/documents")
-def get_user_documents(
+#checking the processed videos of the user
+@app.get("/videos")
+def get_user_videos(
     current_user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    user_docs = db.query(models.PDFDocument).filter(
-        models.PDFDocument.user_id == int(current_user_id)
+    user_videos = db.query(models.ProcessedVideo).filter(
+        models.ProcessedVideo.user_id == int(current_user_id)
     ).all()
 
-    return {"documents" : user_docs}
+    return {"videos": user_videos}
 
-#deleting documents
+#deleting a processed video record
 
-@app.delete("/documents/{document_id}")
-def delete_document(
-    document_id: int,
+@app.delete("/videos/{video_id}")
+def delete_video(
+    video_id: int,
     current_user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    doc = db.query(models.PDFDocument).filter(
-        models.PDFDocument.id == document_id,
-        models.PDFDocument.user_id == int(current_user_id)
+    video = db.query(models.ProcessedVideo).filter(
+        models.ProcessedVideo.id == video_id,
+        models.ProcessedVideo.user_id == int(current_user_id)
     ).first()
 
-    if not doc:
+    if not video:
         raise HTTPException(status_code=404,                
-            detail="Document not found or you don't have permission to delete it."
+            detail="Video not found or you don't have permission to delete it."
     )
     
     #delete the file from the server
-    file_path = f"{UPLOAD_DIR}/{doc.filename}"
+    file_path = f"{UPLOAD_DIR}/{video.filename}"
     if os.path.exists(file_path):
         os.remove(file_path)
 
     #delete the record from the database
-    db.delete(doc)
+    db.delete(video)
     db.commit()
 
-    return {"message": f"'{doc.filename}' deleted successfully."}
-
-@app.get("/documents")
-def get_documents(current_user_id: str = Depends(get_current_user), db: Session = Depends(get_db)):
-    
-    docs = db.query(models.PDFDocument).filter(models.PDFDocument.user_id == int(current_user_id)).all()
-    return docs
+    return {"message": f"'{video.filename}' deleted successfully."}
 
 @app.websocket("/ws/task/{task_id}")
 async def websocket_task_status(websocket: WebSocket, task_id: str):

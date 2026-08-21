@@ -20,3 +20,5 @@ frontend/dist-ssr/
 frontend/*.local
 frontend/.env
 frontend/.env.*
+
+backend/uploaded_videos/*.mp4
