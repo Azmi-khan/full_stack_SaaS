@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import axios from 'axios'
 import './Dashboard.css'
+import Radar from './Radar'
 
 function Dashboard() {
   const navigate = useNavigate()
@@ -14,6 +15,10 @@ function Dashboard() {
   const [progress, setProgress] = useState(0)
   const [isProcessing, setIsProcessing] = useState(false)
   const [processedVideo, setProcessedVideo] = useState(null)
+  
+  // State for Radar Telemetry
+  const [videoTime, setVideoTime] = useState(0)
+  const [telemetry, setTelemetry] = useState(null)
 
   const [videos, setVideos] = useState([])
 
@@ -62,7 +67,8 @@ function Dashboard() {
     setFile(e.target.files[0])
     setUploadMessage('')
     setUploadError(false)
-    setProcessedVideo(null) // Reset video on new file selection
+    setProcessedVideo(null)
+    setTelemetry(null)
   }
 
   const handleUpload = async () => {
@@ -90,7 +96,6 @@ function Dashboard() {
       setFile(null)
       fetchVideos(token)
 
-      // WebSocket Logic
       if (response.data.task_id) {
         setIsProcessing(true)
         setProgress(0)
@@ -106,10 +111,17 @@ function Dashboard() {
             ws.close()
 
             const baseName = cleanFilename.substring(0, cleanFilename.lastIndexOf('.'))
-
-            // Add a timestamp query parameter to bust the browser cache
             const timestamp = new Date().getTime()
+            
+            // Set the video URL
             setProcessedVideo(`http://127.0.0.1:8000/video/processed_${baseName}.mp4?t=${timestamp}`)
+            
+            // Fetch the telemetry JSON file that the backend just generated
+            if (wsData.telemetry_file) {
+              axios.get(`http://127.0.0.1:8000/telemetry/${wsData.telemetry_file}?t=${timestamp}`)
+                .then(res => setTelemetry(res.data))
+                .catch(err => console.error("Failed to load telemetry data", err))
+            }
 
             setIsProcessing(false)
             setStatus('System ready — awaiting video input')
@@ -182,14 +194,28 @@ function Dashboard() {
 
         {processedVideo && (
           <section className="dash-panel">
-            <div className="dash-panel-label">03 — Output</div>
-            <div className="dash-video-frame">
-              <span className="dash-corner tl" />
-              <span className="dash-corner tr" />
-              <span className="dash-corner bl" />
-              <span className="dash-corner br" />
-              {/* key forces a fresh mount so the video element never shows stale/cached frames */}
-              <video key={processedVideo} controls src={processedVideo} />
+            <div className="dash-panel-label">03 — Output & Telemetry</div>
+            <div style={{ display: 'flex', gap: '20px', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+              
+              {/* Video Player */}
+              <div className="dash-video-frame" style={{ flex: '1 1 60%' }}>
+                <span className="dash-corner tl" />
+                <span className="dash-corner tr" />
+                <span className="dash-corner bl" />
+                <span className="dash-corner br" />
+                <video 
+                  key={processedVideo} 
+                  controls 
+                  src={processedVideo} 
+                  onTimeUpdate={(e) => setVideoTime(e.target.currentTime)} 
+                />
+              </div>
+
+              {/* BEV Radar */}
+              <div style={{ flex: '1 1 35%', display: 'flex', justifyContent: 'center' }}>
+                <Radar currentTime={videoTime} telemetryData={telemetry} />
+              </div>
+
             </div>
           </section>
         )}

@@ -1,3 +1,4 @@
+import json
 from celery import Celery
 import cv2
 import numpy as np
@@ -6,6 +7,8 @@ from moviepy.editor import VideoFileClip
 from ultralytics import YOLO
 from tracker import SimpleTracker
 import depth_estimator
+import fusion
+import radar
 
 celery_app = Celery(
     "vision_tasks",
@@ -16,46 +19,130 @@ celery_app = Celery(
 os.makedirs("uploaded_videos", exist_ok=True)
 
 # --- OBJECT DETECTION MODEL ---
-# Loaded once at import time (per worker process), not per task/frame, so weights
-# aren't reloaded from disk on every video or every frame.
-# yolov8n.pt = "nano" checkpoint: smallest/fastest YOLOv8 variant, good default for
-# CPU inference or getting something running before tuning for accuracy vs speed.
 detector = YOLO("yolov8n.pt")
 
-# Only draw boxes for classes relevant to a driving scene. YOLOv8n is trained on
-# COCO's 80 classes, so without this filter it will happily box "teddy bear" or
-# "kite" if one happens to be in frame.
 RELEVANT_CLASSES = {
     "person", "bicycle", "car", "motorcycle", "bus", "truck",
     "traffic light", "stop sign"
 }
 
-DETECTION_BOX_COLOR = (0, 165, 255)  # orange (BGR) - visually distinct from the green lane lines
+DETECTION_BOX_COLOR = (0, 165, 255)  
+
+# --- THREAT LEVEL COLORS ---
+COLOR_CRITICAL = (0, 0, 255)      # Red for TTC < 2.5s
+COLOR_WARNING = (0, 255, 255)     # Yellow for TTC < 5.0s - was the same as DETECTION_BOX_COLOR, made them indistinguishable
+COLOR_NORMAL = (60, 200, 60)      # Green for Safe / Receding
+
+MANUAL_ROAD_BOTTOM_RATIO = None
+MANUAL_HORIZON_RATIO = None
+
+# --- LAYER 0: CAMERA CALIBRATION ---
+def detect_road_bottom(frame, search_start_ratio=0.55, search_end_ratio=0.95):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 100, 200)
+
+    height = edges.shape[0]
+    search_start = int(height * search_start_ratio)
+    search_end = int(height * search_end_ratio)
+
+    row_edge_counts = edges[search_start:search_end, :].sum(axis=1)
+
+    if row_edge_counts.max() <= 0:
+        return height  
+
+    best_row_offset = int(np.argmax(row_edge_counts))
+    return search_start + best_row_offset
+
+def detect_horizon_y(frame, road_bottom_y, search_top_ratio=0.15):
+    height, width = frame.shape[:2]
+    search_top = int(height * search_top_ratio)
+    fallback_y = int(height * 0.55)
+
+    if road_bottom_y <= search_top:
+        return fallback_y
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 100, 200)
+    search_region = edges[search_top:road_bottom_y, :]
+
+    lines = cv2.HoughLinesP(
+        search_region, rho=2, theta=np.pi / 180, threshold=40,
+        lines=np.array([]), minLineLength=30, maxLineGap=80
+    )
+
+    if lines is None:
+        return fallback_y
+
+    left_candidates = []
+    right_candidates = []
+
+    for line in lines:
+        x1, y1, x2, y2 = line.flatten()
+        if x1 == x2:
+            continue
+
+        y1_full = y1 + search_top
+        y2_full = y2 + search_top
+        slope = (y2_full - y1_full) / (x2 - x1)
+        intercept = y1_full - slope * x1
+
+        if not (0.4 < abs(slope) < 3.0):
+            continue
+
+        if slope < 0:
+            left_candidates.append((slope, intercept))
+        else:
+            right_candidates.append((slope, intercept))
+
+    if not left_candidates or not right_candidates:
+        return fallback_y
+
+    intersections_y = []
+    for l_slope, l_intercept in left_candidates:
+        for r_slope, r_intercept in right_candidates:
+            if l_slope == r_slope:
+                continue
+            x_int = (r_intercept - l_intercept) / (l_slope - r_slope)
+            y_int = l_slope * x_int + l_intercept
+            if search_top <= y_int <= road_bottom_y:
+                intersections_y.append(y_int)
+
+    if not intersections_y:
+        return fallback_y
+
+    return int(np.median(intersections_y))
 
 # --- LAYER 1: SPATIAL FILTERING ---
 def region_of_interest(img, vertices):
-    """Masks the image to keep only the road area, blocking the sky and background."""
     mask = np.zeros_like(img)
     match_mask_color = 255
     cv2.fillPoly(mask, vertices, match_mask_color)
     return cv2.bitwise_and(img, mask)
 
-def make_coordinates(image, line_parameters):
-    """Calculates the coordinates, ensuring they stop before the new, lower horizon."""
+def make_coordinates(image, line_parameters, side, road_bottom_y, horizon_y):
     slope, intercept = line_parameters
-    y1 = image.shape[0]        
+    y1 = road_bottom_y
+    y2 = horizon_y
     
-    # The crucial fix for this specific camera angle:
-    y2 = int(y1 * 0.8)         
+    x1 = (y1 - intercept) / slope
+    x2 = (y2 - intercept) / slope
+
+    center_x = image.shape[1] / 2
+    margin = image.shape[1] * 0.02  
+
+    if side == 'left':
+        x1 = min(x1, center_x - margin)
+        x2 = min(x2, center_x - margin)
+    else:  
+        x1 = max(x1, center_x + margin)
+        x2 = max(x2, center_x + margin)
     
-    x1 = int((y1 - intercept) / slope)
-    x2 = int((y2 - intercept) / slope)
-    
-    return [x1, y1, x2, y2]
+    return [int(x1), y1, int(x2), y2]
 
 # --- LAYER 2: MATHEMATICAL FILTERING ---
-def average_slope_intercept(image, lines):
-    """Filters out noise using strict boundaries and robust median mathematics."""
+def average_slope_intercept(image, lines, road_bottom_y, horizon_y):
     left_fit = []
     right_fit = []
     
@@ -74,11 +161,9 @@ def average_slope_intercept(image, lines):
         slope = parameters[0]
         intercept = parameters[1]
         
-        # STRICT BOUNDARIES: Ignore horizontal (< 0.5) and vertical (> 2.0)
         if not (0.5 < abs(slope) < 2.0):
             continue
             
-        # SPLIT SCREEN: Ensure slope matches the correct half of the screen
         if slope < 0 and x1 < (width * 0.5):
             left_fit.append((slope, intercept))
         elif slope > 0 and x1 > (width * 0.5):
@@ -87,33 +172,29 @@ def average_slope_intercept(image, lines):
     left_line = None
     right_line = None
     
-    # MEDIAN FILTERING: mathematically ignores extreme outliers
-    if left_fit:
+    if len(left_fit) >= 2:
         left_fit_median = np.median(left_fit, axis=0)
-        left_line = make_coordinates(image, left_fit_median)
+        left_line = make_coordinates(image, left_fit_median, 'left', road_bottom_y, horizon_y)
         
-    if right_fit:
+    if len(right_fit) >= 2:
         right_fit_median = np.median(right_fit, axis=0)
-        right_line = make_coordinates(image, right_fit_median)
+        right_line = make_coordinates(image, right_fit_median, 'right', road_bottom_y, horizon_y)
         
     return [left_line, right_line]
 
-# --- LAYER 2b: TEMPORAL SMOOTHING (removes frame-to-frame jitter) ---
-SMOOTHING_ALPHA = 0.25          # how much weight the new frame gets vs. history (0-1, lower = smoother/laggier)
-MAX_COAST_FRAMES = 5            # how many consecutive frames to keep the last known line when nothing is detected
+# --- LAYER 2b: TEMPORAL SMOOTHING ---
+SMOOTHING_ALPHA = 0.25          
+MAX_COAST_FRAMES = 5            
 
-def smooth_line(current, previous_state):
-    """
-    Blends this frame's detected line with the previous frame's smoothed line so a
-    single noisy frame can't make the overlay jump. If no line is detected this
-    frame, coasts on the last known line for a few frames instead of dropping it
-    (which is what caused the flicker), then gives up if it's really gone.
-    Returns (line_to_draw, new_state) where new_state carries forward for next frame.
-    """
+def smooth_line(current, previous_state, max_jump_px=None):
     if previous_state is None:
         prev_line, coast_count = None, 0
     else:
         prev_line, coast_count = previous_state
+
+    if current is not None and prev_line is not None and max_jump_px is not None:
+        if abs(current[0] - prev_line[0]) > max_jump_px:
+            current = None  
 
     if current is not None:
         if prev_line is None:
@@ -125,14 +206,12 @@ def smooth_line(current, previous_state):
             ]
         return smoothed, (smoothed, 0)
 
-    # No detection this frame - coast on the previous line for a few frames
     if prev_line is not None and coast_count < MAX_COAST_FRAMES:
         return prev_line, (prev_line, coast_count + 1)
 
     return None, (None, 0)
 
 def draw_lines(img, lines, color=[0, 255, 0], thickness=10):
-    """Draws exactly two smooth, thick tracking lines on the frame."""
     line_img = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
     
     if lines is not None:
@@ -145,14 +224,12 @@ def draw_lines(img, lines, color=[0, 255, 0], thickness=10):
 
 # --- LAYER 3: OBJECT DETECTION + TRACKING ---
 MOTION_SYMBOLS = {
-    "approaching": "^ ",   # box growing frame-to-frame = getting closer
-    "receding": "v ",      # box shrinking = moving away
+    "approaching": "^ ",   
+    "receding": "v ",      
     "steady": "= ",
 }
 
 def extract_relevant_detections(results):
-    """Pulls (label, box) pairs out of a YOLO result, filtered to driving-relevant
-    classes. This is the tracker's input - just what was seen this frame, no IDs yet."""
     detections = []
     for box in results.boxes:
         cls_id = int(box.cls[0])
@@ -163,37 +240,64 @@ def extract_relevant_detections(results):
         detections.append((label, (x1, y1, x2, y2)))
     return detections
 
-def draw_tracks(img, tracks_with_proximity):
-    """Draws bounding boxes labeled with each object's persistent track ID,
-    approach/recession arrow, and a depth-based proximity score (0-100,
-    higher = closer to the camera this frame)."""
-    for track_id, label, box, motion_state, proximity in tracks_with_proximity:
+def draw_tracks(img, tracks_with_metrics):
+    for track_id, label, box, motion_state, proximity, distance_m, ttc_s in tracks_with_metrics:
         x1, y1, x2, y2 = map(int, box)
 
-        cv2.rectangle(img, (x1, y1), (x2, y2), DETECTION_BOX_COLOR, 2)
+        if ttc_s is not None and ttc_s < 2.5:
+            box_color = COLOR_CRITICAL
+            ttc_display = f" ! TTC:{ttc_s:.1f}s !"
+            thickness = 3
+        elif ttc_s is not None and ttc_s < 5.0:
+            box_color = COLOR_WARNING
+            ttc_display = f" TTC:{ttc_s:.1f}s"
+            thickness = 2
+        else:
+            box_color = COLOR_NORMAL if motion_state == "receding" else DETECTION_BOX_COLOR
+            ttc_display = ""
+            thickness = 2
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), box_color, thickness)
 
         symbol = MOTION_SYMBOLS.get(motion_state, "")
-        prox_text = f" prox{proximity}" if proximity is not None else ""
-        text = f"#{track_id} {symbol}{label}{prox_text}"
-        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(img, (x1, y1 - text_h - 6), (x1 + text_w + 4, y1), DETECTION_BOX_COLOR, -1)
-        cv2.putText(img, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        distance_text = f" {distance_m:.1f}m" if distance_m is not None else ""
+        prox_text = f" ({proximity})" if proximity is not None else ""
+        text = f"#{track_id} {symbol}{label}{distance_text}{prox_text}{ttc_display}"
+
+        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        
+        cv2.rectangle(img, (x1, max(0, y1 - text_h - 8)), (x1 + text_w + 6, max(0, y1)), box_color, -1)
+        text_color = (255, 255, 255) if box_color == COLOR_CRITICAL else (0, 0, 0)
+        cv2.putText(img, text, (x1 + 3, max(text_h + 2, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
 
     return img
 
-def attach_proximity(tracks, depth_map):
-    """Looks up each track's median depth within its box and converts it to a
-    readable 0-100 proximity score. Returns 5-tuples instead of the tracker's
-    original 4-tuples, ready for draw_tracks."""
-    if depth_map is None:
-        return [(tid, label, box, motion, None) for tid, label, box, motion in tracks]
-
+def attach_metrics(tracks, depth_map, tracker, focal_length_px, timestamp_s):
     enriched = []
     for track_id, label, box, motion_state in tracks:
-        raw_depth = depth_estimator.box_depth(depth_map, box)
-        proximity = depth_estimator.normalize_proximity(raw_depth, depth_map)
-        enriched.append((track_id, label, box, motion_state, proximity))
+        proximity = None
+        if depth_map is not None:
+            raw_depth = depth_estimator.box_depth(depth_map, box)
+            proximity = depth_estimator.normalize_proximity(raw_depth, depth_map)
+
+        raw_distance_m = fusion.estimate_distance_m(box, label, focal_length_px)
+        track_obj = tracker.tracks.get(track_id)
+        
+        distance_m = None
+        ttc_s = None
+        if track_obj:
+            distance_m, ttc_s = track_obj.update_distance(raw_distance_m, timestamp_s)
+        else:
+            distance_m = raw_distance_m
+
+        enriched.append((track_id, label, box, motion_state, proximity, distance_m, ttc_s))
     return enriched
+
+# --- LAYER 4: INVERSE PERSPECTIVE MAPPING (IPM) ---
+# get_ipm_matrix, draw_radar, and overlay_radar now live in radar.py (imported
+# above) - this used to duplicate get_ipm_matrix here and never actually call
+# draw_radar/overlay_radar, so the BEV panel was computed but never rendered
+# onto the output video, only logged as raw coordinates into the telemetry JSON.
 
 @celery_app.task(bind=True)
 def process_video_task(self, filename: str):
@@ -211,7 +315,8 @@ def process_video_task(self, filename: str):
         return {"status": "error", "message": "Could not open video file."}
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    raw_fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = raw_fps if raw_fps and raw_fps > 0 else 30.0  # guards against 0/unreported fps breaking VideoWriter and timestamps
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
@@ -220,23 +325,35 @@ def process_video_task(self, filename: str):
 
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(temp_avi_path, fourcc, fps, (width, height))
+
+    focal_length_px = fusion.estimate_focal_length_px(width)
+
+    ret, first_frame = cap.read()
+    if MANUAL_ROAD_BOTTOM_RATIO is not None:
+        road_bottom_y = int(height * MANUAL_ROAD_BOTTOM_RATIO)
+    else:
+        road_bottom_y = detect_road_bottom(first_frame) if ret else height
+
+    if MANUAL_HORIZON_RATIO is not None:
+        horizon_y = int(height * MANUAL_HORIZON_RATIO)
+    else:
+        horizon_y = detect_horizon_y(first_frame, road_bottom_y) if ret else int(height * 0.55)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    print(f"[calibration] frame height={height}, road_bottom_y={road_bottom_y} ({road_bottom_y/height:.0%}), horizon_y={horizon_y} ({horizon_y/height:.0%})")
     
     current_frame = 0
 
-    # Smoothing state, carried across frames within this video (reset per video/task,
-    # not shared globally, so one video's lane position never bleeds into the next).
     left_smooth_state = None
     right_smooth_state = None
-
-    # Object tracker, also scoped per video for the same reason - track IDs
-    # start fresh at #1 for every new video processed.
     tracker = SimpleTracker()
 
-    # Depth estimation is expensive, so it's only recomputed every
-    # DEPTH_INTERVAL frames; frames in between reuse the last known depth
-    # map rather than paying MiDaS's cost every single frame.
     DEPTH_INTERVAL = 5
     last_depth_map = None
+    
+    # Initialize Radar Matrix and Telemetry Log
+    ipm_matrix = radar.get_ipm_matrix(width, height, horizon_y, road_bottom_y)
+    telemetry_log = {}
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -245,29 +362,21 @@ def process_video_task(self, filename: str):
             
         current_frame += 1
         
-        # 1. Grayscale & Blur (Removing color and noise)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # 2. Canny Edge Detection (The "stick-like" outlines of the world)
         edges = cv2.Canny(blurred, 100, 200)
         
-        # 3. Apply the ROI Mask (Black out everything except the road/obstacles ahead)
-        # This is re-enabled: without it, Hough runs on the WHOLE frame - sky,
-        # background, dashboard/hood edges - which is what was causing jitter
-        # (noisy edges shifting the fit every frame) and failures on video from
-        # different camera angles (irrelevant edges dominating the left/right split).
+        # Original 15% / 85% Restored
         polygons = np.array([
             [
-                (0, height),                              # Bottom-Left: absolute left edge
-                (int(width * 0.15), int(height * 0.55)),  # Top-Left: wide, up near the horizon
-                (int(width * 0.85), int(height * 0.55)),  # Top-Right: wide, up near the horizon
-                (width, height)                           # Bottom-Right: absolute right edge
+                (0, road_bottom_y),                                        
+                (int(width * 0.15), horizon_y),                            
+                (int(width * 0.85), horizon_y),                            
+                (width, road_bottom_y)                                     
             ]
         ], dtype=np.int32)
         masked_edges = region_of_interest(edges, polygons)
 
-        # 4. Calculate Hough Lines (on the masked/ROI edges, not the raw full-frame edges)
         lines = cv2.HoughLinesP(
             masked_edges, 
             rho=2,             
@@ -278,51 +387,65 @@ def process_video_task(self, filename: str):
             maxLineGap=100     
         )
         
-        # 5. Calculate final mathematical tracking lines
-        raw_averaged_lines = average_slope_intercept(frame, lines)
+        raw_averaged_lines = average_slope_intercept(frame, lines, road_bottom_y, horizon_y)
 
-        # 5b. Temporal smoothing: blend this frame's line with the previous frame's
-        # line (EMA), and coast on the last known line if this frame found none.
-        # This is what removes the frame-to-frame "jitter" - a single frame ever
-        # having no lines detected no longer makes the overlay flicker/jump.
         raw_left = raw_averaged_lines[0] if raw_averaged_lines else None
         raw_right = raw_averaged_lines[1] if raw_averaged_lines else None
 
-        left_line, left_smooth_state = smooth_line(raw_left, left_smooth_state)
-        right_line, right_smooth_state = smooth_line(raw_right, right_smooth_state)
+        # Original 15% Jump Threshold Restored
+        left_line, left_smooth_state = smooth_line(raw_left, left_smooth_state, max_jump_px=width * 0.15)
+        right_line, right_smooth_state = smooth_line(raw_right, right_smooth_state, max_jump_px=width * 0.15)
         averaged_lines = [left_line, right_line]
         
-        # 6. Run object detection on the real color frame (not the edge map -
-        # YOLO needs actual color/texture information, edges alone won't work)
         detection_results = detector(frame, verbose=False)[0]
         frame_detections = extract_relevant_detections(detection_results)
 
-        # 7. Feed this frame's detections into the tracker. It matches them
-        # against objects it already knows about (by IOU + class), so the same
-        # car keeps the same ID frame-to-frame instead of being redetected as
-        # a stranger every time - and we get an approaching/receding read on
-        # each one from how its box size is trending.
         active_tracks = tracker.update(frame_detections)
 
-        # 8. Depth estimation (recomputed only every DEPTH_INTERVAL frames -
-        # see note above). Gives each track a proximity score independent of
-        # its box shape, which the pure area-based motion arrow can't provide
-        # (e.g. a car changing lanes distorts box size without getting closer).
+        timestamp_s = current_frame / fps
+
         if current_frame % DEPTH_INTERVAL == 0 or last_depth_map is None:
             last_depth_map = depth_estimator.estimate_depth(frame)
 
-        tracks_with_proximity = attach_proximity(active_tracks, last_depth_map)
+        tracks_with_metrics = attach_metrics(
+            active_tracks, last_depth_map, tracker, focal_length_px, timestamp_s
+        )
         
-        # --- COMBINED OUTPUT: real video + lane overlay + tracked object boxes ---
-        # Previously this drew lane lines onto the Canny edge view only. Bounding
-        # boxes on an edges-only frame give no visual context for what was
-        # detected, so both layers now draw on the original color frame.
+        # --- NEW: LOG TELEMETRY FOR THIS FRAME ---
+        time_key = str(round(timestamp_s, 1))
+        if time_key not in telemetry_log:
+            telemetry_log[time_key] = []
+
+        for track_id, label, box, motion_state, proximity, distance_m, ttc_s in tracks_with_metrics:
+            x1, y1, x2, y2 = box
+            
+            bottom_center = np.array([[[ (x1 + x2) / 2.0, float(y2) ]]], dtype=np.float32)
+            warped = cv2.perspectiveTransform(bottom_center, ipm_matrix)
+            rx, ry = int(warped[0][0][0]), int(warped[0][0][1])
+            
+            telemetry_log[time_key].append({
+                "id": track_id,
+                "label": label,
+                "x": rx,
+                "y": ry,
+                "ttc": ttc_s,
+                "distance": distance_m
+            })
+        
+        # --- COMBINED OUTPUT ---
         final_frame = draw_lines(frame, averaged_lines)
-        final_frame = draw_tracks(final_frame, tracks_with_proximity)
+        final_frame = draw_tracks(final_frame, tracks_with_metrics)
+
+        # Render the bird's-eye-view threat radar panel onto the frame.
+        # ipm_matrix was already being used to log radar-space coordinates
+        # into telemetry_log below, but draw_radar/overlay_radar were never
+        # actually called, so the radar panel itself never appeared on the
+        # output video.
+        radar_canvas = radar.draw_radar(tracks_with_metrics, ipm_matrix)
+        final_frame = radar.overlay_radar(final_frame, radar_canvas)
         
         out.write(final_frame)
         
-        # (Progress bar logic remains exactly the same below here...)
         if current_frame % 10 == 0 or current_frame >= total_frames:
             progress_percent = min(int((current_frame / total_frames) * 90), 90)
             self.update_state(state='PROGRESS', meta={'progress': progress_percent})
@@ -335,7 +458,19 @@ def process_video_task(self, filename: str):
     clip.write_videofile(final_mp4_path, codec="libx264", audio=False, logger=None)
     clip.close()
     
+    print("Saving telemetry log...")
+    json_filename = f"telemetry_{base_name}.json"
+    json_path = f"./uploaded_videos/{json_filename}"
+    
+    with open(json_path, 'w') as f:
+        json.dump(telemetry_log, f)
+    
     if os.path.exists(temp_avi_path):
         os.remove(temp_avi_path)
     
-    return {"status": "success", "file": f"processed_{base_name}.mp4", "progress": 100}
+    return {
+        "status": "success", 
+        "file": f"processed_{base_name}.mp4", 
+        "telemetry_file": json_filename, 
+        "progress": 100
+    }

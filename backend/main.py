@@ -33,8 +33,6 @@ SECRET_KEY = "my_brand_new_secret_key_123"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-
-
 #password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -55,7 +53,6 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
-
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         if user_id is None:
@@ -66,11 +63,8 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-
 #user signup
-
 @app.post("/signup", response_model=schemas.UserResponse)
-
 def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
     #checking if the user is existing or not
     db_user = db.query(models.User).filter(models.User.email == user.email).first()
@@ -90,8 +84,6 @@ def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
 
     return new_user
 
-
-
 #user login and token generation
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -107,10 +99,8 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     access_token = create_access_token(data={"sub": str(user.id)})
     return {"access_token": access_token, "token_type": "bearer"}  
 
-
 #token vlidation and access to secure data
 @app.get("/secure-data")
-
 def get_secure_data(current_user_id: str = Depends(get_current_user)):
     return {
         "message": "Access Granted! You have a valid token.",
@@ -138,8 +128,6 @@ async def upload_video(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Record this upload so it shows up in the user's run history and can be deleted later.
-    # (Previously nothing was ever saved here, so /videos always came back empty.)
     new_video = models.ProcessedVideo(filename=safe_filename, user_id=int(current_user_id))
     db.add(new_video)
     db.commit()
@@ -163,7 +151,6 @@ def get_user_videos(
     return {"videos": user_videos}
 
 #deleting a processed video record
-
 @app.delete("/videos/{video_id}")
 def delete_video(
     video_id: int,
@@ -200,11 +187,14 @@ async def websocket_task_status(websocket: WebSocket, task_id: str):
             result = AsyncResult(task_id)
             
             if result.state == 'PROGRESS':
-                
                 await websocket.send_json({"progress": result.info.get('progress', 0)})
             elif result.state == 'SUCCESS':
-                
-                await websocket.send_json({"progress": 100, "status": "completed"})
+                # Pass the telemetry file name back over the websocket
+                await websocket.send_json({
+                    "progress": 100, 
+                    "status": "completed", 
+                    "telemetry_file": result.info.get('telemetry_file')
+                })
                 break
                 
             await asyncio.sleep(1) 
@@ -213,7 +203,6 @@ async def websocket_task_status(websocket: WebSocket, task_id: str):
 
 @app.get("/video/{filename}")
 def get_processed_video(filename: str):
-    # Construct absolute path to ensure FastAPI looks in the correct directory
     file_path = os.path.abspath(os.path.join(UPLOAD_DIR, filename))
     print(f"Looking for video at: {file_path}")
     
@@ -221,3 +210,12 @@ def get_processed_video(filename: str):
         return FileResponse(file_path, media_type="video/mp4")
     
     raise HTTPException(status_code=404, detail=f"Processed video not found at: {file_path}")
+
+# --- NEW: Serve the Telemetry JSON file to the React frontend ---
+@app.get("/telemetry/{filename}")
+def get_telemetry_file(filename: str):
+    file_path = os.path.abspath(os.path.join(UPLOAD_DIR, filename))
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="application/json")
+    
+    raise HTTPException(status_code=404, detail="Telemetry file not found.")

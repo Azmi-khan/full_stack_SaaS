@@ -1,0 +1,169 @@
+.radar-container {
+  width: 100%;
+  max-width: 320px;
+  aspect-ratio: 3 / 4;
+  background: radial-gradient(ellipse at 50% 100%, #06140a 0%, #030a06 65%, #000000 100%);
+  border: 2px solid #1a3324;
+  border-radius: 12px;
+  position: relative;
+  overflow: hidden;
+  box-shadow:
+    inset 0 0 60px rgba(0, 0, 0, 0.85),
+    inset 0 0 24px rgba(62, 207, 107, 0.06),
+    0 0 18px rgba(0, 0, 0, 0.5);
+}
+
+/* CRT-style scanline texture */
+.radar-container::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.025) 0px,
+    rgba(255, 255, 255, 0.025) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  pointer-events: none;
+  z-index: 7;
+}
+
+/* Vignette to darken the corners */
+.radar-container::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at 50% 100%, transparent 45%, rgba(0, 0, 0, 0.65) 100%);
+  pointer-events: none;
+  z-index: 7;
+}
+
+/* Concentric range rings */
+.radar-rings {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 200%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 74%, rgba(62, 207, 107, 0.4) 75%, transparent 76%),
+    radial-gradient(circle, transparent 49%, rgba(62, 207, 107, 0.35) 50%, transparent 51%),
+    radial-gradient(circle, transparent 24%, rgba(62, 207, 107, 0.3) 25%, transparent 26%);
+}
+
+/* Crosshair through the ego vehicle, like a real scope's bearing lines */
+.radar-crosshair-v {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  height: 100%;
+  background: linear-gradient(to top, rgba(62, 207, 107, 0.3), transparent 85%);
+  transform: translateX(-50%);
+  z-index: 1;
+}
+
+.radar-crosshair-h {
+  position: absolute;
+  bottom: 22%;
+  left: 8%;
+  width: 84%;
+  height: 1px;
+  background: linear-gradient(to right, transparent, rgba(62, 207, 107, 0.18) 15%, rgba(62, 207, 107, 0.18) 85%, transparent);
+  z-index: 1;
+}
+
+/* Range ring labels - qualitative (NEAR/MID/FAR), not fake precise metres,
+   since the underlying data is a perspective-warped position, not a true
+   radial distance measurement. Positions roughly align with the ring
+   gradient stops above. */
+.radar-range-label {
+  position: absolute;
+  left: 52%;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: rgba(140, 255, 180, 0.55);
+  text-shadow: 0 0 4px rgba(62, 207, 107, 0.5);
+  z-index: 2;
+  pointer-events: none;
+}
+
+.radar-range-label.near { bottom: 16%; }
+.radar-range-label.mid { bottom: 35%; }
+.radar-range-label.far { bottom: 54%; }
+
+/* Sweeping scanner beam - a tighter bright edge with a fading trail behind
+   it, closer to how a real radar sweep reads, rather than a flat wide fan */
+.radar-scanner {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  width: 100%;
+  height: 100%;
+  transform-origin: bottom center;
+  background: conic-gradient(
+    from 270deg at 50% 100%,
+    rgba(140, 255, 180, 0.55) 0deg,
+    rgba(62, 207, 107, 0.22) 10deg,
+    rgba(62, 207, 107, 0.06) 30deg,
+    transparent 45deg
+  );
+  animation: sweep 3.2s linear infinite;
+  z-index: 2;
+  mix-blend-mode: screen;
+}
+
+@keyframes sweep {
+  0% { transform: translateX(-50%) rotate(-90deg); }
+  100% { transform: translateX(-50%) rotate(90deg); }
+}
+
+/* The Ego Vehicle (Your Car) - a forward-pointing chevron instead of a
+   plain box, so it visually reads as "this way is forward" */
+.radar-ego {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 18px;
+  height: 30px;
+  background: #eafff2;
+  clip-path: polygon(50% 0%, 100% 100%, 50% 78%, 0% 100%);
+  z-index: 10;
+  filter: drop-shadow(0 0 6px rgba(234, 255, 242, 0.8));
+}
+
+/* Tracked Threat Dots */
+.radar-target {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  transition: left 0.15s linear, top 0.15s linear;
+  box-shadow: 0 0 10px 2px currentColor;
+  animation: blip-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes blip-pulse {
+  0%, 100% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  50% { opacity: 0.55; transform: translate(-50%, -50%) scale(1.35); }
+}
+
+.radar-target::after {
+  content: attr(data-id);
+  position: absolute;
+  top: -17px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.85);
+  white-space: nowrap;
+}
